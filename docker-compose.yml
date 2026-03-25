@@ -1,0 +1,179 @@
+###############################################################################
+# NERV HQ — Unit-00 (VPN gateway) + Unit-01 (ISO torrent seeder)
+# ProtonVPN via WireGuard + qBittorrent-nox with automatic port forwarding
+#
+# Prerequisites:
+#   1. ProtonVPN paid subscription (Plus or higher — free tier has no P2P)
+#   2. Generate a WireGuard config at:
+#      https://account.proton.me/u/0/vpn/WireGuard
+#      - Platform: GNU/Linux
+#      - Protocol: WireGuard
+#      - NAT Type: NAT-PMP (required for port forwarding)
+#      - VPN Accelerator: ON
+#      - Pick a P2P-friendly server (look for the P2P icon)
+#   3. Copy the PrivateKey from the downloaded .conf file
+#   4. Copy the .env.example to .env and fill in your values
+#   5. Create the directory structure:
+#      mkdir -p /data/raid6/torrents/{downloads,watch,incomplete}
+#      mkdir -p /data/raid6/torrents/config/qbittorrent
+#      mkdir -p /data/raid6/torrents/config/gluetun
+#
+# Network flow:
+#   qBittorrent --[network_mode]--> Gluetun --[WireGuard]--> ProtonVPN
+#   All torrent traffic exits via the VPN tunnel.
+#   If the tunnel drops, Gluetun's kill switch blocks ALL traffic.
+#   The qBittorrent web UI is accessible on your LAN via Gluetun's ports.
+#
+# Port forwarding:
+#   ProtonVPN assigns a random port via NAT-PMP. Gluetun negotiates this
+#   automatically and exposes it via its control API at :8000.
+#   The update-port.sh script polls this API and syncs the port into
+#   qBittorrent's listening port config via its web API.
+###############################################################################
+
+services:
+
+  # =========================================================================
+  # Unit-00 — VPN gateway (Gluetun)
+  # The prototype EVA. Protective barrier. Nothing gets through without it.
+  # =========================================================================
+  unit-00-vpn:
+    image: qmcgaw/gluetun:v3.41.0
+    container_name: unit-00-vpn
+    hostname: unit-00
+    restart: unless-stopped
+    cap_add:
+      - NET_ADMIN
+    devices:
+      - /dev/net/tun:/dev/net/tun
+
+    # Ports are defined HERE because qBittorrent uses this container's
+    # network stack. Any port you need to reach on qBittorrent gets
+    # mapped on the Gluetun container.
+    ports:
+      - "${QBIT_WEBUI_PORT:-8080}:8080"     # qBittorrent web UI
+      - "8000:8000"                           # Gluetun control API (LAN only)
+
+    volumes:
+      - ${GLUETUN_DATA:-./config/gluetun}:/gluetun
+
+    environment:
+      # --- VPN provider ---
+      - VPN_SERVICE_PROVIDER=protonvpn
+      - VPN_TYPE=wireguard
+      - WIREGUARD_PRIVATE_KEY=${WIREGUARD_PRIVATE_KEY:?Set your ProtonVPN WireGuard private key}
+
+      # --- Server selection ---
+      # Pick a US server for best peering from Colorado.
+      # You can also use SERVER_HOSTNAMES for a specific server.
+      - SERVER_COUNTRIES=${VPN_COUNTRY:-United States}
+
+      # --- Port forwarding (critical for seeding) ---
+      # Gluetun negotiates a forwarded port via NAT-PMP with ProtonVPN.
+      # Without this, peers cannot initiate connections to you.
+      - VPN_PORT_FORWARDING=on
+      - VPN_PORT_FORWARDING_PROVIDER=protonvpn
+
+      # --- DNS ---
+      # Use ProtonVPN's DNS to prevent leaks. Gluetun blocks non-tunnel DNS.
+      - DOT=off
+      - DNS_ADDRESS=10.2.0.1
+
+      # --- Firewall ---
+      # Allow your LAN subnet to reach the web UIs through the tunnel.
+      # Adjust this to match your VLAN/subnet.
+      - FIREWALL_INPUT_PORTS=8080,8000
+      - FIREWALL_OUTBOUND_SUBNETS=${LAN_SUBNET:-10.0.0.0/20}
+
+      # --- Health check ---
+      - HEALTH_VPN_DURATION_INITIAL=30s
+      - HEALTH_SUCCESS_WAIT_DURATION=10s
+
+      # --- Timezone ---
+      - TZ=${TZ:-America/Denver}
+
+    healthcheck:
+      test: /gluetun-entrypoint healthcheck
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 60s
+
+  # =========================================================================
+  # Unit-01 — ISO torrent seeder (qBittorrent-nox)
+  # The test type. First into battle. Community's front line.
+  # =========================================================================
+  unit-01-seeder:
+    image: lscr.io/linuxserver/qbittorrent:latest
+    container_name: unit-01-seeder
+    hostname: unit-01
+
+    # THIS IS THE KEY LINE: qBittorrent uses Gluetun's network stack.
+    # All traffic from this container exits through the VPN tunnel.
+    # If the VPN drops, this container has NO network access at all.
+    network_mode: "service:unit-00-vpn"
+
+    restart: unless-stopped
+    depends_on:
+      unit-00-vpn:
+        condition: service_healthy
+
+    volumes:
+      # qBittorrent config — persists settings, categories, RSS rules
+      - ${QBIT_CONFIG:-./config/qbittorrent}:/config
+
+      # Torrent data — point this at your RAID6 bulk storage
+      # This is where ISOs live after download and during seeding
+      - ${TORRENT_DATA:-/data/raid6/torrents/downloads}:/downloads
+
+      # Watch folder — drop .torrent files here for auto-add
+      - ${TORRENT_WATCH:-/data/raid6/torrents/watch}:/watch
+
+      # Incomplete downloads — keeps partial files separate
+      - ${TORRENT_INCOMPLETE:-/data/raid6/torrents/incomplete}:/incomplete
+
+    environment:
+      - PUID=${PUID:-1000}
+      - PGID=${PGID:-1000}
+      - TZ=${TZ:-America/Denver}
+      - WEBUI_PORT=8080
+      # Disable the built-in VPN since Gluetun handles it
+      - DOCKER_MODS=
+
+  # =========================================================================
+  # Sync agent — keeps qBittorrent's listening port in sync with ProtonVPN
+  # ProtonVPN assigns a random forwarded port via NAT-PMP. This port can
+  # change on reconnect. This container polls Gluetun's API and updates
+  # qBittorrent automatically so peers can always reach you for seeding.
+  # =========================================================================
+  port-sync:
+    image: alpine:latest
+    container_name: unit-01-port-sync
+    hostname: port-sync
+    restart: unless-stopped
+    depends_on:
+      unit-00-vpn:
+        condition: service_healthy
+
+    # Runs on the host network (NOT through VPN) so it can reach both
+    # Gluetun's control API and qBittorrent's web API on the LAN.
+    network_mode: "service:unit-00-vpn"
+
+    volumes:
+      - ./update-port.sh:/update-port.sh:ro
+
+    environment:
+      - QBIT_USER=${QBIT_USER:-admin}
+      - QBIT_PASS=${QBIT_PASS:?Set your qBittorrent web UI password}
+      - TZ=${TZ:-America/Denver}
+
+    entrypoint: /bin/sh
+    command: >
+      -c "
+        apk add --no-cache curl jq;
+        echo 'Port sync agent started. Polling every 60s...';
+        while true; do
+          sh /update-port.sh;
+          sleep 60;
+        done
+      "
